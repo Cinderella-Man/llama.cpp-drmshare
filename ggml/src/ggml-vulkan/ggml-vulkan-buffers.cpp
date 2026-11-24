@@ -1086,3 +1086,121 @@ vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, size_t si
     return buf;
 }
 
+#if !defined(_WIN32)
+// P2P all-reduce (GGML_VK_ALLREDUCE_P2P=1): device-local memory exported as a dma-buf, imported on a peer.
+static vk::Buffer ggml_vk_create_external_buffer(vk_device & device, size_t size) {
+    vk::BufferUsageFlags usage = vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc |
+                                 vk::BufferUsageFlagBits::eTransferDst;
+    if (device->buffer_device_address) {
+        usage |= vk::BufferUsageFlagBits::eShaderDeviceAddress;
+    }
+    vk::ExternalMemoryBufferCreateInfo ext{ vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT };
+    vk::BufferCreateInfo bci{ vk::BufferCreateFlags(), size, usage, vk::SharingMode::eExclusive, 0, nullptr };
+    bci.setPNext(&ext);
+    return device->device.createBuffer(bci);
+}
+
+static void ggml_vk_finish_external_buffer(vk_device & device, vk_buffer & buf, size_t size, vk::MemoryPropertyFlags flags) {
+    device->device.bindBufferMemory(buf->buffer, buf->device_memory, 0);
+    buf->memory_property_flags = flags;
+    buf->ptr = nullptr;
+    buf->device = device;
+    buf->size = size;
+    if (device->buffer_device_address) {
+        const vk::BufferDeviceAddressInfo addressInfo(buf->buffer);
+        buf->bda_addr = device->device.getBufferAddress(addressInfo);
+    }
+}
+
+vk_buffer ggml_vk_create_buffer_dmabuf_export(vk_device & device, size_t size, int * fd) {
+    *fd = -1;
+    if (!device->external_memory_dmabuf) {
+        return {};
+    }
+    vk_buffer buf = std::make_shared<vk_buffer_struct>();
+    buf->buffer = ggml_vk_create_external_buffer(device, size);
+    const vk::MemoryRequirements req = device->device.getBufferMemoryRequirements(buf->buffer);
+    const vk::PhysicalDeviceMemoryProperties mem_props = device->physical_device.getMemoryProperties();
+    uint32_t type = UINT32_MAX;
+    for (int pass = 0; pass < 2 && type == UINT32_MAX; pass++) {  // plain VRAM first
+        for (uint32_t t = 0; t < mem_props.memoryTypeCount; t++) {
+            const vk::MemoryPropertyFlags f = mem_props.memoryTypes[t].propertyFlags;
+            if ((req.memoryTypeBits & (1u << t)) && (f & vk::MemoryPropertyFlagBits::eDeviceLocal) &&
+                (pass == 1 || !(f & vk::MemoryPropertyFlagBits::eHostVisible))) {
+                type = t;
+                break;
+            }
+        }
+    }
+    if (type == UINT32_MAX) {
+        device->device.destroyBuffer(buf->buffer);
+        return {};
+    }
+    vk::ExportMemoryAllocateInfo exp{ vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT };
+    vk::MemoryAllocateFlags alloc_flags{};
+    if (device->buffer_device_address) {
+        alloc_flags |= vk::MemoryAllocateFlagBits::eDeviceAddress;
+    }
+    vk::MemoryAllocateFlagsInfo flags_info{ alloc_flags };
+    exp.setPNext(&flags_info);
+    try {
+        buf->device_memory = device->device.allocateMemory({ req.size, type, &exp });
+    } catch (const vk::SystemError & e) {
+        GGML_LOG_WARN("ggml_vulkan: dma-buf export allocation failed (%s)\n", e.what());
+        device->device.destroyBuffer(buf->buffer);
+        return {};
+    }
+    ggml_vk_finish_external_buffer(device, buf, size, mem_props.memoryTypes[type].propertyFlags);
+    auto get_fd = (PFN_vkGetMemoryFdKHR) device->device.getProcAddr("vkGetMemoryFdKHR");
+    VkMemoryGetFdInfoKHR gi{};
+    gi.sType      = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR;
+    gi.memory     = (VkDeviceMemory) buf->device_memory;
+    gi.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+    if (get_fd == nullptr || get_fd((VkDevice) device->device, &gi, fd) != VK_SUCCESS) {
+        *fd = -1;
+        return {};  // buf frees its memory and buffer
+    }
+    return buf;
+}
+
+// On success the driver owns fd; on failure the caller still does.
+vk_buffer ggml_vk_create_buffer_dmabuf_import(vk_device & device, size_t size, int fd) {
+    if (!device->external_memory_dmabuf) {
+        return {};
+    }
+    auto get_props = (PFN_vkGetMemoryFdPropertiesKHR) device->device.getProcAddr("vkGetMemoryFdPropertiesKHR");
+    VkMemoryFdPropertiesKHR fdp{};
+    fdp.sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR;
+    if (get_props == nullptr ||
+        get_props((VkDevice) device->device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, fd, &fdp) != VK_SUCCESS) {
+        return {};
+    }
+    vk_buffer buf = std::make_shared<vk_buffer_struct>();
+    buf->buffer = ggml_vk_create_external_buffer(device, size);
+    const vk::MemoryRequirements req = device->device.getBufferMemoryRequirements(buf->buffer);
+    const uint32_t bits = req.memoryTypeBits & fdp.memoryTypeBits;
+    if (bits == 0) {
+        GGML_LOG_WARN("ggml_vulkan: peer dma-buf not importable (memory types 0x%x / 0x%x)\n", req.memoryTypeBits, fdp.memoryTypeBits);
+        device->device.destroyBuffer(buf->buffer);
+        return {};
+    }
+    const uint32_t type = __builtin_ctz(bits);
+    const vk::PhysicalDeviceMemoryProperties mem_props = device->physical_device.getMemoryProperties();
+    vk::ImportMemoryFdInfoKHR imp{ vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT, fd };
+    vk::MemoryAllocateFlags alloc_flags{};
+    if (device->buffer_device_address) {
+        alloc_flags |= vk::MemoryAllocateFlagBits::eDeviceAddress;
+    }
+    vk::MemoryAllocateFlagsInfo flags_info{ alloc_flags };
+    imp.setPNext(&flags_info);
+    try {
+        buf->device_memory = device->device.allocateMemory({ std::max<vk::DeviceSize>(req.size, size), type, &imp });
+    } catch (const vk::SystemError & e) {
+        GGML_LOG_WARN("ggml_vulkan: peer dma-buf import failed (%s)\n", e.what());
+        device->device.destroyBuffer(buf->buffer);
+        return {};
+    }
+    ggml_vk_finish_external_buffer(device, buf, size, mem_props.memoryTypes[type].propertyFlags);
+    return buf;
+}
+#endif

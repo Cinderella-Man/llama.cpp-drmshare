@@ -43,6 +43,7 @@ struct vk_comm_device {
     ggml_backend_vk_context *          ctx      = nullptr;
     void *                             host_ptr = nullptr;
     std::vector<ggml_backend_buffer_t> host_buf; // host_ptr imported into each peer
+    std::vector<ggml_backend_buffer_t> recv_buf; // P2P: [i] = this device's VRAM receive buffer as seen by device i
 
     struct {
         PFN_vkGetSemaphoreFdKHR    get_fd    = nullptr;
@@ -66,6 +67,7 @@ struct ggml_backend_vk_comm_context {
     ggml_context *              tctx     = nullptr;
     ggml_tensor *               slot     = nullptr;
     bool                        disabled = false;
+    bool                        p2p      = false; // GGML_VK_ALLREDUCE_P2P=1 and every device imports dma-bufs
 
     std::thread                 thread;
     std::chrono::nanoseconds    spin{ 200'000 };
@@ -79,6 +81,12 @@ struct ggml_backend_vk_comm_context {
 
 static void ggml_vk_comm_free_buffers(ggml_backend_vk_comm_context * comm) {
     for (vk_comm_device & d : comm->devs) {
+        for (ggml_backend_buffer_t & buf : d.recv_buf) {
+            if (buf) {
+                ggml_backend_buffer_free(buf);
+            }
+            buf = nullptr;
+        }
         for (ggml_backend_buffer_t & buf : d.host_buf) {
             ggml_backend_buffer_free(buf);
             buf = nullptr;
@@ -87,6 +95,44 @@ static void ggml_vk_comm_free_buffers(ggml_backend_vk_comm_context * comm) {
         d.host_ptr = nullptr;
     }
     comm->cap = 0;
+}
+
+// P2P receive buffer layout: [round & 1][source device] slots of cap bytes
+static size_t ggml_vk_comm_p2p_offs(const ggml_backend_vk_comm_context * comm, uint64_t round, size_t src) {
+    return ((round & 1) * comm->devs.size() + src) * comm->cap;
+}
+
+static bool ggml_vk_comm_p2p_alloc(ggml_backend_vk_comm_context * comm, size_t cap) {
+    const size_t n    = comm->devs.size();
+    const size_t size = 2 * n * cap;
+    for (size_t j = 0; j < n; j++) {
+        vk_comm_device & d = comm->devs[j];
+        d.recv_buf.assign(n, nullptr);
+        int fd = -1;
+        vk_buffer own = ggml_vk_create_buffer_dmabuf_export(d.ctx->device, size, &fd);
+        if (!own) {
+            return false;
+        }
+        d.recv_buf[j] = ggml_backend_vk_wrap_buffer(ggml_backend_get_device(d.backend), own);
+        for (size_t i = 0; i < n; i++) {
+            if (i == j) {
+                continue;
+            }
+            const int dfd = dup(fd);
+            vk_buffer imp = dfd >= 0 ? ggml_vk_create_buffer_dmabuf_import(comm->devs[i].ctx->device, size, dfd) : vk_buffer{};
+            if (!imp) {
+                if (dfd >= 0) {
+                    close(dfd);
+                }
+                close(fd);
+                return false;
+            }
+            d.recv_buf[i] = ggml_backend_vk_wrap_buffer(ggml_backend_get_device(comm->devs[i].backend), imp);
+        }
+        close(fd);
+    }
+    GGML_LOG_INFO("ggml_vulkan: P2P all-reduce: %zu MiB receive buffer in each device's VRAM\n", size >> 20);
+    return true;
 }
 
 static bool ggml_backend_vk_comm_ensure(ggml_backend_vk_comm_context * comm, size_t nbytes) {
@@ -108,6 +154,15 @@ static bool ggml_backend_vk_comm_ensure(ggml_backend_vk_comm_context * comm, siz
 
     const size_t n   = comm->devs.size();
     const size_t cap = GGML_PAD(nbytes, comm->align);
+    if (comm->p2p) {
+        if (ggml_vk_comm_p2p_alloc(comm, cap)) {
+            comm->cap = cap;
+            return true;
+        }
+        GGML_LOG_WARN("ggml_vulkan: P2P all-reduce buffers failed, using host memory\n");
+        ggml_vk_comm_free_buffers(comm);
+        comm->p2p = false;
+    }
     for (size_t i = 0; i < n; i++) {
         vk_comm_device & d = comm->devs[i];
         if (posix_memalign(&d.host_ptr, comm->align, 2 * cap) != 0) {
@@ -483,6 +538,11 @@ void * ggml_backend_vk_comm_init(ggml_backend_t * backends, size_t n_backends) {
     if (std::all_of(comm->devs.begin(), comm->devs.end(), ggml_vk_comm_sfd_supported)) {
         comm->mode = vk_comm_sync::sync_fd;
     }
+    if (getenv("GGML_VK_ALLREDUCE_P2P") != nullptr &&
+        std::all_of(comm->devs.begin(), comm->devs.end(), [](const vk_comm_device & d) { return d.ctx->device->external_memory_dmabuf; })) {
+        comm->p2p = true;
+        GGML_LOG_INFO("ggml_vulkan: all-reduce writes straight into peer VRAM (dma-buf P2P)\n");
+    }
 
     if (const char * spin = getenv("GGML_VK_ALLREDUCE_SPIN_US")) {
         comm->spin = std::chrono::microseconds(std::max(0, atoi(spin)));
@@ -541,15 +601,37 @@ bool ggml_backend_vk_comm_allreduce_tensor(void * comm_ctx, ggml_tensor ** tenso
         ggml_backend_vk_context * ctx = d.ctx;
         ggml_tensor *             t   = tensors[i];
         vk_buffer & tbuf = ((ggml_backend_vk_buffer_context *) t->buffer->context)->dev_buffer;
-        vk_buffer & hbuf = ((ggml_backend_vk_buffer_context *) d.host_buf[i]->context)->dev_buffer;
         const size_t toffs = vk_tensor_offset(t) + t->view_offs;
 
         vk_context c = ggml_vk_get_compute_ctx(ctx);
         ggml_vk_sync_buffers(ctx, c);
-        if (!(t->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+        if (comm->p2p) {
+            // write the partial straight into each peer's receive buffer (the peer's VRAM, imported here)
+            for (size_t j = 0; j < n; j++) {
+                if (j == i) {
+                    continue;
+                }
+                ggml_backend_buffer_t rb    = comm->devs[j].recv_buf[i];
+                vk_buffer &           rbuf  = ((ggml_backend_vk_buffer_context *) rb->context)->dev_buffer;
+                const size_t          roffs = ggml_vk_comm_p2p_offs(comm, round, i);
+                if (!(t->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+                    c->s->buffer->buf.fillBuffer(rbuf->buffer, roffs, GGML_PAD(slot_size, 4), 0);
+                } else if (wire == GGML_TYPE_F32) {
+                    ggml_vk_buffer_copy_async(c, rbuf, roffs, tbuf, toffs, nbytes);
+                } else {
+                    ggml_vk_comm_set_slot(comm->slot, t, wire, rb, roffs);
+                    ggml_vk_cpy(ctx, c, t, comm->slot);
+                }
+            }
+            if (!(t->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+                c->s->buffer->buf.fillBuffer(tbuf->buffer, toffs, nbytes, 0);
+            }
+        } else if (!(t->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+            vk_buffer & hbuf = ((ggml_backend_vk_buffer_context *) d.host_buf[i]->context)->dev_buffer;
             c->s->buffer->buf.fillBuffer(hbuf->buffer, slot_offs, GGML_PAD(slot_size, 4), 0);
             c->s->buffer->buf.fillBuffer(tbuf->buffer, toffs, nbytes, 0);
         } else if (wire == GGML_TYPE_F32) {
+            vk_buffer & hbuf = ((ggml_backend_vk_buffer_context *) d.host_buf[i]->context)->dev_buffer;
             ggml_vk_buffer_copy_async(c, hbuf, slot_offs, tbuf, toffs, nbytes);
         } else {
             ggml_vk_comm_set_slot(comm->slot, t, wire, d.host_buf[i], slot_offs);
@@ -577,7 +659,11 @@ bool ggml_backend_vk_comm_allreduce_tensor(void * comm_ctx, ggml_tensor ** tenso
             if (j == i) {
                 continue;
             }
-            ggml_vk_comm_set_slot(comm->slot, tensors[i], wire, comm->devs[j].host_buf[i], slot_offs);
+            if (comm->p2p) {
+                ggml_vk_comm_set_slot(comm->slot, tensors[i], wire, comm->devs[i].recv_buf[i], ggml_vk_comm_p2p_offs(comm, round, j));
+            } else {
+                ggml_vk_comm_set_slot(comm->slot, tensors[i], wire, comm->devs[j].host_buf[i], slot_offs);
+            }
             ggml_vk_add(ctx, c, tensors[i], comm->slot, tensors[i]);
             ggml_vk_sync_buffers(ctx, c);
         }

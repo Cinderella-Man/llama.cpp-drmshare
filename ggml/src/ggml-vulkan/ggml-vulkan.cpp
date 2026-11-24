@@ -4705,6 +4705,10 @@ vk_device ggml_vk_get_device(size_t idx) {
                 device->external_memory_host = true;
             } else if (strcmp("VK_KHR_external_semaphore_fd", properties.extensionName) == 0) {
                 device->external_semaphore = true;
+            } else if (strcmp("VK_KHR_external_memory_fd", properties.extensionName) == 0) {
+                device->external_memory_fd = true;
+            } else if (strcmp("VK_EXT_external_memory_dma_buf", properties.extensionName) == 0) {
+                device->external_memory_dmabuf = true;
 #if defined(VK_EXT_shader_64bit_indexing)
             } else if (strcmp("VK_EXT_shader_64bit_indexing", properties.extensionName) == 0) {
                 device->shader_64b_indexing = true;
@@ -5089,6 +5093,12 @@ vk_device ggml_vk_get_device(size_t idx) {
         }
         if (device->external_semaphore) {
             device_extensions.push_back("VK_KHR_external_semaphore_fd");
+        }
+        if (device->external_memory_fd && device->external_memory_dmabuf) {
+            device_extensions.push_back("VK_KHR_external_memory_fd");
+            device_extensions.push_back("VK_EXT_external_memory_dma_buf");
+        } else {
+            device->external_memory_dmabuf = false;
         }
 
 #if defined(VK_EXT_shader_64bit_indexing)
@@ -17471,6 +17481,17 @@ ggml_backend_buffer_t ggml_backend_vk_device_buffer_from_host_ptr(ggml_backend_d
     ggml_backend_buffer_t ret = ggml_backend_buffer_init(ggml_backend_vk_device_get_buffer_type(dev), ggml_backend_vk_buffer_interface, bufctx, size);
 
     return ret;
+}
+
+ggml_backend_buffer_t ggml_backend_vk_wrap_buffer(ggml_backend_dev_t dev, vk_buffer buf) {
+    if (!buf) {
+        return nullptr;
+    }
+    ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
+    auto device = ggml_vk_get_device(ctx->device);
+    const size_t size = buf->size;
+    ggml_backend_vk_buffer_context * bufctx = new ggml_backend_vk_buffer_context(device, std::move(buf), device->name);
+    return ggml_backend_buffer_init(ggml_backend_vk_device_get_buffer_type(dev), ggml_backend_vk_buffer_interface, bufctx, size);
 }
 
 static const struct ggml_backend_device_i ggml_backend_vk_device_i = {

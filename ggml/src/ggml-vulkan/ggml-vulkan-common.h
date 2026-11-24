@@ -68,6 +68,9 @@ void ggml_vk_buffer_copy_n(const vk_buffer_copy_region * regions, size_t n);
 void ggml_vk_buffer_memset_async(vk_context& ctx, vk_buffer& dst, size_t offset, uint32_t c, size_t size);
 void ggml_vk_buffer_memset(vk_buffer& dst, size_t offset, uint32_t c, size_t size);
 vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, size_t size);
+vk_buffer ggml_vk_create_buffer_dmabuf_export(vk_device & device, size_t size, int * fd);
+vk_buffer ggml_vk_create_buffer_dmabuf_import(vk_device & device, size_t size, int fd);
+ggml_backend_buffer_t ggml_backend_vk_wrap_buffer(ggml_backend_dev_t dev, vk_buffer buf);
 
 // pipelines
 size_t vk_tensor_offset(const ggml_tensor * tensor);
