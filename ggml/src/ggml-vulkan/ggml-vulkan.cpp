@@ -4573,6 +4573,30 @@ static bool ggml_vk_has_rebar(const vk::PhysicalDevice & physical_device) {
 
 static void ggml_vk_device_start_keepalive(vk_device& device);
 
+// Runs before the driver's own exit handler (see the registration in ggml_vk_get_device).
+static void ggml_vk_release_devices_at_exit() {
+    for (auto & dev : vk_instance.devices) {
+        if (dev) {
+            try {
+                dev->device.waitIdle();
+            } catch (...) {
+            }
+            // The device's own buffer type and staging buffer hold references back to it, so it would never be
+            // destroyed; drop them, so that the reset below runs ~vk_device_struct (pipelines, then the device).
+            if (dev->buffer_type.context) {
+                ((ggml_backend_vk_buffer_type_context *) dev->buffer_type.context)->device.reset();
+            }
+            dev->sync_staging.reset();
+        }
+    }
+    for (auto & dev : vk_instance.devices) {
+        if (dev && getenv("GGML_VK_EXIT_DEBUG")) {
+            fprintf(stderr, "ggml_vulkan: releasing device %s at exit (use_count %ld)\n", dev->name.c_str(), (long) dev.use_count());
+        }
+        dev.reset();
+    }
+}
+
 vk_device ggml_vk_get_device(size_t idx) {
     VK_LOG_DEBUG("ggml_vk_get_device(" << idx << ")");
 
@@ -5626,6 +5650,12 @@ vk_device ggml_vk_get_device(size_t idx) {
 
         // publish the device only when it is fully built
         vk_instance.devices[idx] = device;
+
+        // Exit handlers run in reverse order of registration. This one is registered after the Vulkan driver is
+        // loaded, so it runs before the driver's own handler, which unloads the driver's libraries (NVIDIA 615: its
+        // shader-compile worker could still be running then and crashed the process at exit).
+        static std::once_flag exit_once;
+        std::call_once(exit_once, [] { std::atexit(ggml_vk_release_devices_at_exit); });
 
         return device;
     }
