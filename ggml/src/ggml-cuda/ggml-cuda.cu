@@ -1408,6 +1408,17 @@ struct ggml_backend_cuda_comm_context {
 };
 
 #ifdef GGML_USE_NCCL
+// Tensors with at least this many elements are reduced by NCCL in BF16, smaller ones in FP32.  The default is a
+// heuristic for RTX 4090s connected via 16x PCIe 4.0; GGML_CUDA_NCCL_BF16_MIN_NE=<elements> overrides it (0: always
+// BF16, e.g. for links through host memory, where the bytes cost more than the conversion at every size).
+static int64_t ggml_backend_cuda_nccl_bf16_min_ne(size_t n_ranks) {
+    static const char * env = getenv("GGML_CUDA_NCCL_BF16_MIN_NE");
+    if (env != nullptr) {
+        return (int64_t) strtoll(env, nullptr, 0);
+    }
+    return n_ranks <= 2 ? 32768 : n_ranks == 3 ? 131072 : 262144;
+}
+
 // AllReduce via NCCL. Reduces as FP32 for small tensors and BF16 for large
 // tensors (bandwidth-bound), then converts back to FP32.
 static bool ggml_backend_cuda_comm_allreduce_nccl(
@@ -1428,9 +1439,8 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
         GGML_ASSERT(ggml_is_contiguously_allocated(tensors[i]));
     }
 
-    // For small tensors, simply reduce them as FP32.
-    // The following heuristic for how "small" a tensor should be is based on RTX 4090s connected via 16x PCIe 4.0.
-    if ((n_ranks <= 2 && ne < 32768) || (n_ranks == 3 && ne < 131072) || (n_ranks >= 4 && ne < 262144)) {
+    // For small tensors, simply reduce them as FP32 (see ggml_backend_cuda_nccl_bf16_min_ne).
+    if (ne < ggml_backend_cuda_nccl_bf16_min_ne(n_ranks)) {
         for (size_t i = 0; i < n_backends; ++i) {
             if ((tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
                 ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
@@ -1643,7 +1653,9 @@ static void ggml_backend_cuda_comm_init_split(ggml_backend_cuda_comm_context * r
         return;
     }
     const char * s = getenv("GGML_CUDA_ALLREDUCE_SPLIT");
-    ret->split_bytes = s ? (size_t) strtoull(s, nullptr, 0) : ((size_t) 1 << 20);
+    // Default 256 KiB: on a Tesla V100 (PCIe 3.0 x4) + RTX 3090 through host memory the lanes cross at about 16
+    // tokens of a 5120-wide model (320 KiB); with 1 MiB, batches of 24-48 tokens stayed on the slower lane.
+    ret->split_bytes = s ? (size_t) strtoull(s, nullptr, 0) : ((size_t) 256 << 10);
     ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_split;
     GGML_LOG_INFO("split AllReduce: tensors below %zu bytes internal, from there NCCL\n", ret->split_bytes);
 #else
