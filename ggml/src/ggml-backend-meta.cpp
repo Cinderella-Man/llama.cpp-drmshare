@@ -16,6 +16,7 @@
 #include <set>
 #include <string>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -1915,6 +1916,18 @@ struct ggml_backend_meta_context {
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
 
+    // Asynchronous all-reduce (GGML_META_ASYNC_AR=1, if the backend has ggml_backend_comm_allreduce_tensor_async):
+    // each all-reduce is issued asynchronously and a later subgraph waits for it only if it reads the reduced tensor,
+    // so independent subgraphs in between (e.g. a model's token chunks) overlap the communication.
+    typedef bool (*comm_allreduce_async_t)(void * comm_ctx, struct ggml_tensor ** tensors, int slot);
+    typedef void (*comm_wait_t)(void * comm_ctx, int slot);
+    static constexpr int                 async_slots          = 64;
+    comm_allreduce_async_t               comm_allreduce_async = nullptr;
+    comm_wait_t                          comm_wait            = nullptr;
+    bool                                 async_ar             = false;
+    uint64_t                             async_slot_next      = 0;
+    std::vector<std::vector<int>>        subgraph_deps; // per subgraph: earlier subgraphs whose reduced tensor it reads
+
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
         const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
         n_reduce_steps = std::ceil(std::log2(n_devs));
@@ -1945,6 +1958,14 @@ struct ggml_backend_meta_context {
                 ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(
                     ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_allreduce_tensor");
             GGML_ASSERT(comm_allreduce != nullptr);
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(simple_backends[0]));
+            comm_allreduce_async = (comm_allreduce_async_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_allreduce_tensor_async");
+            comm_wait            = (comm_wait_t)            ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_wait");
+            const char * env = getenv("GGML_META_ASYNC_AR");
+            async_ar = env != nullptr && atoi(env) != 0 && comm_allreduce_async != nullptr && comm_wait != nullptr;
+            if (async_ar) {
+                GGML_LOG_INFO("%s: asynchronous all-reduce (GGML_META_ASYNC_AR)\n", __func__);
+            }
         }
     }
 
@@ -2401,6 +2422,42 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 cgraph_ij->uid = ggml_graph_next_uid();
             }
         }
+
+        // Which earlier all-reduce each subgraph reads (through a source or a chain of views), for GGML_META_ASYNC_AR.
+        // The graph allocator keeps a reduced tensor alive until its last reader, so a subgraph that does not read it
+        // cannot overwrite it while the all-reduce is in flight.
+        if (backend_ctx->async_ar) {
+            auto & bc0 = backend_ctx->backend_configs[0];
+            std::unordered_map<const ggml_tensor *, int> ar_of;
+            for (size_t ig = 0; ig + 1 < n_subgraphs; ig++) {
+                ggml_cgraph * g = bc0.cgraphs[ig].cgraph_main;
+                ar_of[g->nodes[g->n_nodes - 1]] = (int) ig;
+            }
+            backend_ctx->subgraph_deps.assign(n_subgraphs, {});
+            for (size_t ig = 1; ig < n_subgraphs; ig++) {
+                ggml_cgraph * g = bc0.cgraphs[ig].cgraph_main;
+                std::set<int> deps;
+                for (int in = 0; in < g->n_nodes; in++) {
+                    const ggml_tensor * node = g->nodes[in];
+                    for (int is = -1; is < GGML_MAX_SRC; is++) {
+                        const ggml_tensor * t = is < 0 ? node->view_src : node->src[is];
+                        for (; t != nullptr; t = t->view_src) {
+                            auto it = ar_of.find(t);
+                            if (it != ar_of.end() && it->second < (int) ig) {
+                                deps.insert(it->second);
+                            }
+                        }
+                    }
+                }
+                backend_ctx->subgraph_deps[ig].assign(deps.begin(), deps.end());
+            }
+            size_t n_indep = 0;
+            for (size_t ig = 1; ig < n_subgraphs; ig++) {
+                const auto & d = backend_ctx->subgraph_deps[ig];
+                n_indep += d.empty() || d.back() != (int) ig - 1;
+            }
+            GGML_LOG_DEBUG("%s: %zu subgraphs, %zu do not read the all-reduce right before them\n", __func__, n_subgraphs, n_indep);
+        }
     }
 
     size_t iga = 0; // i graph aux
@@ -2551,7 +2608,17 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     };
 
 
+    const bool async_ar = backend_ctx->async_ar && n_backends > 1 && backend_ctx->subgraph_deps.size() == backend_ctx->n_subgraphs;
+    std::vector<int> pending_slot(async_ar ? backend_ctx->n_subgraphs : 0, -1);
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
+        if (async_ar) {
+            for (const int p : backend_ctx->subgraph_deps[i]) {
+                if (pending_slot[p] >= 0) {
+                    backend_ctx->comm_wait(backend_ctx->comm_ctx, pending_slot[p]);
+                    pending_slot[p] = -1;
+                }
+            }
+        }
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
             const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
@@ -2570,7 +2637,27 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     ggml_cgraph * cgraph_ij = bcj.cgraphs[i].cgraph_main;
                     nodes.push_back(cgraph_ij->nodes[cgraph_ij->n_nodes-1]);
                 }
-                backend_allreduce_success = backend_ctx->comm_allreduce(backend_ctx->comm_ctx, nodes.data());
+                // Asynchronous only if the next subgraph does not read the result: otherwise it would wait for it at
+                // once, and the detour through the communication stream only adds latency (-4.5 % on 512-token
+                // batches without chunks). Before a synchronous all-reduce, the compute streams wait for the pending
+                // ones, so the all-reduces keep their order on every device (they may share a communicator).
+                const bool next_reads = async_ar && !backend_ctx->subgraph_deps[i + 1].empty() &&
+                    backend_ctx->subgraph_deps[i + 1].back() == (int) i;
+                if (async_ar && !next_reads) {
+                    const int slot = (int) (backend_ctx->async_slot_next++ % backend_ctx->async_slots);
+                    backend_allreduce_success = backend_ctx->comm_allreduce_async(backend_ctx->comm_ctx, nodes.data(), slot);
+                    if (backend_allreduce_success) {
+                        pending_slot[i] = slot;
+                    }
+                } else {
+                    for (size_t p = 0; async_ar && p < i; p++) {
+                        if (pending_slot[p] >= 0) {
+                            backend_ctx->comm_wait(backend_ctx->comm_ctx, pending_slot[p]);
+                            pending_slot[p] = -1;
+                        }
+                    }
+                    backend_allreduce_success = backend_ctx->comm_allreduce(backend_ctx->comm_ctx, nodes.data());
+                }
             }
 
             if (!backend_allreduce_success) {
@@ -2579,6 +2666,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     return status;
                 }
             }
+        }
+    }
+    for (size_t p = 0; p < pending_slot.size(); p++) {
+        if (pending_slot[p] >= 0) {
+            backend_ctx->comm_wait(backend_ctx->comm_ctx, pending_slot[p]);
         }
     }
     return GGML_STATUS_SUCCESS;

@@ -1381,6 +1381,17 @@ struct ggml_backend_cuda_comm_context {
     // GGML_CUDA_ALLREDUCE=split: tensors below this size go through ar_pipeline, the rest through NCCL.
     size_t                      split_bytes = 0;
 
+    // Asynchronous all-reduce (used by the meta backend with GGML_META_ASYNC_AR=1): allreduce_tensor_async() runs a
+    // tensor of the NCCL lane on a per-device communication stream, after the work enqueued so far on the compute
+    // stream, and records event `slot`; wait(slot) makes the compute streams wait for it.
+    static constexpr int        ASYNC_SLOTS = 64;
+    bool                        async_ready = false;
+    cudaStream_t                async_stream[GGML_CUDA_MAX_DEVICES] = {};
+    cudaEvent_t                 async_ev_compute[GGML_CUDA_MAX_DEVICES] = {};
+    cudaEvent_t                 async_ev[GGML_CUDA_MAX_DEVICES][ASYNC_SLOTS] = {};
+    void *                      async_buf[GGML_CUDA_MAX_DEVICES] = {};  // BF16 staging; one per device, the stream is in order
+    size_t                      async_buf_size[GGML_CUDA_MAX_DEVICES] = {};
+
     // Number of ranks in the communicator when each rank is a separate process. Zero unless
     // comm_init_rank created this context.
     int                         world_size = 0;
@@ -1398,6 +1409,18 @@ struct ggml_backend_cuda_comm_context {
 #endif // GGML_USE_NCCL
 
     ~ggml_backend_cuda_comm_context() {
+        for (size_t i = 0; async_ready && i < dev_ids.size(); ++i) {
+            ggml_cuda_set_device(dev_ids[i]);
+            CUDA_CHECK(cudaStreamSynchronize(async_stream[i]));
+            if (async_buf[i]) {
+                CUDA_CHECK(cudaFree(async_buf[i]));
+            }
+            for (int k = 0; k < ASYNC_SLOTS; ++k) {
+                CUDA_CHECK(cudaEventDestroy(async_ev[i][k]));
+            }
+            CUDA_CHECK(cudaEventDestroy(async_ev_compute[i]));
+            CUDA_CHECK(cudaStreamDestroy(async_stream[i]));
+        }
 #ifdef GGML_USE_NCCL
         for (ncclComm_t comm : comms) {
             NCCL_CHECK(ncclCommDestroy(comm));
@@ -1576,6 +1599,111 @@ static bool ggml_backend_cuda_comm_try_allreduce_split(
 static bool ggml_backend_cuda_comm_try_allreduce_butterfly(
         ggml_backend_cuda_comm_context *, struct ggml_tensor **) {
     return false;
+}
+
+static void ggml_backend_cuda_comm_async_init(ggml_backend_cuda_comm_context * c) {
+    if (c->async_ready) {
+        return;
+    }
+    int prio_lo = 0;
+    int prio_hi = 0;
+    CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&prio_lo, &prio_hi));
+    for (size_t i = 0; i < c->dev_ids.size(); ++i) {
+        ggml_cuda_set_device(c->dev_ids[i]);
+        CUDA_CHECK(cudaStreamCreateWithPriority(&c->async_stream[i], cudaStreamNonBlocking, prio_hi));
+        CUDA_CHECK(cudaEventCreateWithFlags(&c->async_ev_compute[i], cudaEventDisableTiming));
+        for (int k = 0; k < c->ASYNC_SLOTS; ++k) {
+            CUDA_CHECK(cudaEventCreateWithFlags(&c->async_ev[i][k], cudaEventDisableTiming));
+        }
+    }
+    c->async_ready = true;
+}
+
+// Enqueues the all-reduce of `tensors` and records event `slot` after it.  A tensor on the NCCL lane (nccl, or
+// split above its cut) is reduced on the communication streams, after the work enqueued so far on the compute
+// streams, so the compute streams can go on with independent work; anything else runs on the compute streams as
+// usual.  Returns false when the caller has to run its own fallback (as try_allreduce does).
+static bool ggml_backend_cuda_comm_allreduce_tensor_async(void * comm_ctx_v, struct ggml_tensor ** tensors, int slot) {
+    if (comm_ctx_v == nullptr) {
+        return false;
+    }
+    auto * c = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    GGML_ASSERT(slot >= 0 && slot < c->ASYNC_SLOTS);
+    ggml_backend_cuda_comm_async_init(c);
+    const size_t n_backends = c->backends.size();
+    const int64_t ne = ggml_nelements(tensors[0]);
+#ifdef GGML_USE_NCCL
+    const bool nccl_lane = !c->comms.empty() && c->world_size == 0 && tensors[0]->type == GGML_TYPE_F32 &&
+        (c->try_allreduce == ggml_backend_cuda_comm_try_allreduce_nccl ||
+         (c->try_allreduce == ggml_backend_cuda_comm_try_allreduce_split && ggml_nbytes(tensors[0]) >= c->split_bytes));
+    if (nccl_lane && ne > 0) {
+        const bool   use_bf16 = ne >= ggml_backend_cuda_nccl_bf16_min_ne(c->n_ranks());
+        const size_t nbytes   = (size_t) ne * (use_bf16 ? sizeof(nv_bfloat16) : sizeof(float));
+        to_bf16_cuda_t to_bf16 = ggml_get_to_bf16_cuda(GGML_TYPE_F32);
+        to_fp32_cuda_t to_fp32 = ggml_get_to_fp32_cuda(GGML_TYPE_BF16);
+        void * buf[GGML_CUDA_MAX_DEVICES] = {};
+        for (size_t i = 0; i < n_backends; ++i) {
+            GGML_ASSERT(ggml_nelements(tensors[i]) == ne && ggml_is_contiguously_allocated(tensors[i]));
+            ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) c->backends[i]->context;
+            ggml_cuda_set_device(cuda_ctx->device);
+            cudaStream_t s = c->async_stream[i];
+            if (use_bf16 && c->async_buf_size[i] < nbytes) {
+                CUDA_CHECK(cudaStreamSynchronize(s));
+                if (c->async_buf[i]) {
+                    CUDA_CHECK(cudaFree(c->async_buf[i]));
+                }
+                CUDA_CHECK(cudaMalloc(&c->async_buf[i], nbytes));
+                c->async_buf_size[i] = nbytes;
+            }
+            buf[i] = use_bf16 ? c->async_buf[i] : tensors[i]->data;
+            CUDA_CHECK(cudaEventRecord(c->async_ev_compute[i], cuda_ctx->stream()));
+            CUDA_CHECK(cudaStreamWaitEvent(s, c->async_ev_compute[i]));
+            if ((tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                CUDA_CHECK(cudaMemsetAsync(buf[i], 0, nbytes, s));
+            } else if (use_bf16) {
+                to_bf16(tensors[i]->data, (nv_bfloat16 *) buf[i], ne, s);
+                CUDA_CHECK(cudaGetLastError());
+            }
+        }
+        NCCL_CHECK(ncclGroupStart());
+        for (size_t i = 0; i < n_backends; ++i) {
+            NCCL_CHECK(ncclAllReduce(buf[i], buf[i], ne, use_bf16 ? ncclBfloat16 : ncclFloat, ncclSum, c->comms[i],
+                                     c->async_stream[i]));
+        }
+        NCCL_CHECK(ncclGroupEnd());
+        for (size_t i = 0; i < n_backends; ++i) {
+            ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) c->backends[i]->context;
+            ggml_cuda_set_device(cuda_ctx->device);
+            cudaStream_t s = c->async_stream[i];
+            if (use_bf16) {
+                to_fp32(buf[i], (float *) tensors[i]->data, ne, s);
+                CUDA_CHECK(cudaGetLastError());
+            }
+            CUDA_CHECK(cudaEventRecord(c->async_ev[i][slot], s));
+        }
+        return true;
+    }
+#endif // GGML_USE_NCCL
+    const bool ok = c->try_allreduce(c, tensors);
+    for (size_t i = 0; i < n_backends; ++i) {
+        ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) c->backends[i]->context;
+        ggml_cuda_set_device(cuda_ctx->device);
+        CUDA_CHECK(cudaEventRecord(c->async_ev[i][slot], cuda_ctx->stream()));
+    }
+    return ok;
+}
+
+// The compute streams wait for the all-reduce recorded as `slot`.
+static void ggml_backend_cuda_comm_wait(void * comm_ctx_v, int slot) {
+    auto * c = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    if (c == nullptr || !c->async_ready) {
+        return;
+    }
+    for (size_t i = 0; i < c->backends.size(); ++i) {
+        ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) c->backends[i]->context;
+        ggml_cuda_set_device(cuda_ctx->device);
+        CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), c->async_ev[i][slot]));
+    }
 }
 
 static void ggml_backend_cuda_comm_free(void * comm_ctx_v) {
@@ -7114,6 +7242,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
         return (void *)ggml_backend_cuda_comm_allreduce_tensor;
+    }
+    if (strcmp(name, "ggml_backend_comm_allreduce_tensor_async") == 0) {
+        return (void *)ggml_backend_cuda_comm_allreduce_tensor_async;
+    }
+    if (strcmp(name, "ggml_backend_comm_wait") == 0) {
+        return (void *)ggml_backend_cuda_comm_wait;
     }
 #ifdef GGML_USE_NCCL
     if (strcmp(name, "ggml_backend_comm_init_rank") == 0) {
