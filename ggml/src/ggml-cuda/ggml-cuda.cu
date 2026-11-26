@@ -1369,14 +1369,17 @@ struct ggml_backend_cuda_comm_context {
     std::vector<ggml_backend_t> backends;
     std::vector<int>            dev_ids;
 
-    // Set by the init chain (comm_init_{nccl, internal, none}) to one of
-    // try_allreduce_{nccl, internal, butterfly}.  nccl needs `comms`,
-    // internal needs `ar_pipeline`, butterfly needs nothing.  Per-call
+    // Set by the init chain (comm_init_{nccl, internal, split, none}) to one of
+    // try_allreduce_{nccl, internal, split, butterfly}.  nccl needs `comms`,
+    // internal needs `ar_pipeline`, split needs both, butterfly needs nothing.  Per-call
     // failures return false; the meta backend's generic implementation then
     // handles that call.
     try_allreduce_fn            try_allreduce = nullptr;
 
     ggml_cuda_ar_pipeline *     ar_pipeline = nullptr;
+
+    // GGML_CUDA_ALLREDUCE=split: tensors below this size go through ar_pipeline, the rest through NCCL.
+    size_t                      split_bytes = 0;
 
     // Number of ranks in the communicator when each rank is a separate process. Zero unless
     // comm_init_rank created this context.
@@ -1532,7 +1535,7 @@ static bool ggml_backend_cuda_comm_allreduce_internal(
 }
 
 // ---------------------------------------------------------------------------
-// Per-call dispatch -- three variants, one per backend.  Each is set as
+// Per-call dispatch -- one variant per backend (split: two).  Each is set as
 // comm_ctx->try_allreduce by the matching init step.  Per-call failure
 // returns false; the meta backend's generic implementation handles that call.
 // ---------------------------------------------------------------------------
@@ -1548,6 +1551,17 @@ static bool ggml_backend_cuda_comm_try_allreduce_internal(
         ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
     return ggml_backend_cuda_comm_allreduce_internal(comm_ctx, tensors);
 }
+
+#ifdef GGML_USE_NCCL
+// Two lanes: small tensors through the internal all-reduce (latency), large ones through NCCL (bandwidth).
+static bool ggml_backend_cuda_comm_try_allreduce_split(
+        ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
+    if (ggml_nbytes(tensors[0]) < comm_ctx->split_bytes && ggml_backend_cuda_comm_allreduce_internal(comm_ctx, tensors)) {
+        return true;
+    }
+    return ggml_backend_cuda_comm_allreduce_nccl(comm_ctx, tensors);
+}
+#endif // GGML_USE_NCCL
 
 static bool ggml_backend_cuda_comm_try_allreduce_butterfly(
         ggml_backend_cuda_comm_context *, struct ggml_tensor **) {
@@ -1615,7 +1629,30 @@ static void ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * re
     ggml_backend_cuda_comm_init_internal(ret);
 }
 
-// Top-level init.  Picks one of the three init paths based on
+// GGML_CUDA_ALLREDUCE=split: NCCL and the internal pipeline both, chosen per tensor by size.
+static void ggml_backend_cuda_comm_init_split(ggml_backend_cuda_comm_context * ret) {
+#ifdef GGML_USE_NCCL
+    ggml_backend_cuda_comm_init_nccl(ret);
+    if (ret->try_allreduce != ggml_backend_cuda_comm_try_allreduce_nccl) {
+        return;  // NCCL did not start: the chain already fell back
+    }
+    ret->ar_pipeline = ggml_cuda_ar_pipeline_init(ret->dev_ids.data(), ret->dev_ids.size());
+    if (!ret->ar_pipeline) {
+        (void) cudaGetLastError();
+        GGML_LOG_WARN("split AllReduce: internal pipeline init failed (n_devices != 2?); NCCL only\n");
+        return;
+    }
+    const char * s = getenv("GGML_CUDA_ALLREDUCE_SPLIT");
+    ret->split_bytes = s ? (size_t) strtoull(s, nullptr, 0) : ((size_t) 1 << 20);
+    ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_split;
+    GGML_LOG_INFO("split AllReduce: tensors below %zu bytes internal, from there NCCL\n", ret->split_bytes);
+#else
+    GGML_LOG_WARN("split AllReduce needs NCCL; internal only\n");
+    ggml_backend_cuda_comm_init_internal(ret);
+#endif // GGML_USE_NCCL
+}
+
+// Top-level init.  Picks one of the init paths based on
 // GGML_CUDA_ALLREDUCE (or the platform default) and lets the chain handle
 // any fallback.  Unrecognised env values warn and fall through to the
 // platform default.
@@ -1647,6 +1684,8 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
             ggml_backend_cuda_comm_init_nccl(ret);
         } else if (env_str == "internal") {
             ggml_backend_cuda_comm_init_internal(ret);
+        } else if (env_str == "split") {
+            ggml_backend_cuda_comm_init_split(ret);
         } else if (env_str == "none") {
             ggml_backend_cuda_comm_init_none(ret);
         } else {
