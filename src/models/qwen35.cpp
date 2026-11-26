@@ -159,6 +159,29 @@ llama_model_qwen35::graph::graph(const llm_graph_params & params) :
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
+    // Tensor parallelism: each layer's output projection and FFN in token chunks, ordered so that chunk c+1 does not
+    // read chunk c's results; with the meta backend's asynchronous all-reduce (GGML_META_ASYNC_AR=1) the all-reduce of
+    // one chunk then runs while the next chunk computes. LLAMA_TP_CHUNKS=k forces k chunks (0: none; chunks of at
+    // least LLAMA_TP_CHUNK_MIN tokens, default 64); unset, 2 chunks when the asynchronous all-reduce is on and each
+    // chunk gets at least 512 tokens: smaller chunks cost more than the overlap wins (every chunk reads the weights
+    // again). Not in the last layer (it may crop to the outputs).
+    int n_chunks = 1;
+    if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+        const char * e_k     = getenv("LLAMA_TP_CHUNKS");
+        const char * e_min   = getenv("LLAMA_TP_CHUNK_MIN");
+        const char * e_async = getenv("GGML_META_ASYNC_AR");
+        if (e_k != nullptr) {
+            const int k        = atoi(e_k);
+            const int min_rows = e_min ? atoi(e_min) : 64;
+            if (k > 1 && n_tokens >= (int64_t) k * min_rows) {
+                n_chunks = k;
+            }
+        } else if (e_async != nullptr && atoi(e_async) != 0 && n_tokens >= 2 * 512) {
+            n_chunks = 2;
+        }
+    }
+    const int64_t chunk_rows = ((n_tokens + n_chunks - 1) / n_chunks + 31) / 32 * 32;
+
     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
     for (int il = 0; il < n_layer; ++il) {
         res->t_layer_inp[il] = inpL;
@@ -169,6 +192,49 @@ llama_model_qwen35::graph::graph(const llm_graph_params & params) :
         cb(cur, "attn_norm", il);
 
         ggml_build_forward_expand(gf, cur);
+
+        if (n_chunks > 1 && il < n_layer - 1) {
+            const bool recr = hparams.is_recr(il);
+            ggml_tensor * core = recr ? build_layer_attn_linear(inp->get_recr(), cur, il, /*out_proj =*/ false)
+                                      : build_layer_attn(inp->get_attn(), cur, inp_pos, il, /*out_proj =*/ false);
+            ggml_tensor * wo   = recr ? model.layers[il].ssm_out   : model.layers[il].wo;
+            ggml_tensor * wo_s = recr ? model.layers[il].ssm_out_s : model.layers[il].wo_s;
+            GGML_ASSERT(ggml_is_contiguous(core) && core->ne[1] == n_tokens && core->ne[2] == 1 && core->ne[3] == 1);
+            GGML_ASSERT(ggml_is_contiguous(inpSA) && inpSA->ne[1] == n_tokens);
+
+            std::vector<ggml_tensor *> proj, resid, ffn;
+            for (int64_t r0 = 0; r0 < n_tokens; r0 += chunk_rows) {
+                const int64_t nr = std::min(chunk_rows, n_tokens - r0);
+                ggml_tensor * x = ggml_view_2d(ctx0, core, core->ne[0], nr, core->nb[1], r0 * core->nb[1]);
+                ggml_tensor * p = build_lora_mm(wo, x, wo_s);
+                cb(p, "attn_output_chunk", il);
+                ggml_build_forward_expand(gf, p);
+                proj.push_back(p);
+            }
+            for (size_t c = 0; c < proj.size(); c++) {
+                const int64_t r0 = (int64_t) c * chunk_rows;
+                const int64_t nr = proj[c]->ne[1];
+                ggml_tensor * s = ggml_view_2d(ctx0, inpSA, n_embd, nr, inpSA->nb[1], r0 * inpSA->nb[1]);
+                ggml_tensor * r = ggml_add(ctx0, proj[c], s);
+                cb(r, "attn_residual_chunk", il);
+                ggml_tensor * n = build_norm(r, model.layers[il].attn_post_norm, nullptr, LLM_NORM_RMS, il);
+                ggml_tensor * f = build_layer_ffn(n, il);
+                cb(f, "ffn_out_chunk", il);
+                ggml_build_forward_expand(gf, f);
+                resid.push_back(r);
+                ffn.push_back(f);
+            }
+            ggml_tensor * out = nullptr;
+            for (size_t c = 0; c < ffn.size(); c++) {
+                ggml_tensor * o = ggml_add(ctx0, ffn[c], resid[c]);
+                out = out ? ggml_concat(ctx0, out, o, 1) : o;
+            }
+            cb(out, "post_ffn", il);
+            cur = build_cvec(out, il);
+            cb(cur, "l_out", il);
+            inpL = cur;
+            continue;
+        }
 
         // Determine layer type and build appropriate attention mechanism
         if (hparams.is_recr(il)) {
@@ -287,7 +353,8 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
         llm_graph_input_attn_kv * inp,
         ggml_tensor *             cur,
         ggml_tensor *             inp_pos,
-        int                       il) {
+        int                       il,
+        bool                      out_proj) {
     const int64_t n_embd_head = hparams.n_embd_head_v();
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
 
@@ -347,6 +414,9 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
 
     cur = ggml_mul(ctx0, cur, gate_sigmoid);
     cb(cur, "attn_gated", il);
+    if (!out_proj) {
+        return cur;
+    }
 
     cur = build_lora_mm(model.layers[il].wo, cur, model.layers[il].wo_s);
     cb(cur, "attn_output", il);
@@ -357,7 +427,8 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
 ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
         llm_graph_input_rs * inp,
         ggml_tensor *        cur,
-        int                  il) {
+        int                  il,
+        bool                 out_proj) {
     const auto * mctx_cur = inp->mctx;
 
     const int64_t d_inner      = hparams.ssm_d_inner;
@@ -483,6 +554,9 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     // Final reshape: [head_dim, n_heads, n_tokens, n_seqs] -> [n_heads * head_dim , n_tokens * n_seqs ]
     ggml_tensor * final_output = ggml_reshape_2d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens * n_seqs);
     cb(final_output, "final_output", il);
+    if (!out_proj) {
+        return final_output;
+    }
 
     // Output projection
     cur = build_lora_mm(model.layers[il].ssm_out, final_output, model.layers[il].ssm_out_s);

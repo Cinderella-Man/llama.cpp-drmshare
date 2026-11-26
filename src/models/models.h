@@ -2840,12 +2840,14 @@ struct llama_model_qwen35 : public llama_model_base {
         llm_graph_input_attn_kv * inp_attn,
                     ggml_tensor * cur,
                     ggml_tensor * inp_pos,
-                            int   il);
+                            int   il,
+                           bool   out_proj = true); // false: return the output projection's input (LLAMA_TP_CHUNKS)
 
         ggml_tensor * build_layer_attn_linear(
              llm_graph_input_rs * inp,
                     ggml_tensor * cur,
-                            int   il);
+                            int   il,
+                           bool   out_proj = true);
 
         ggml_tensor * build_layer_ffn(
                     ggml_tensor * cur,
