@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cinttypes>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -154,6 +155,43 @@ int64_t llama_time_us(void) {
     return ggml_time_us();
 }
 
+// tensor parallelism gives every device an equal share of each split tensor unless a split is set (layer split divides
+// by free memory instead), so on devices with different amounts of free memory the smallest one runs out first
+static void llama_warn_even_tensor_split(const llama_model_params & params, const ggml_backend_dev_t * devs, size_t n_devs) {
+    if (n_devs < 2) {
+        return;
+    }
+    if (params.tensor_split != nullptr) {
+        for (size_t i = 0; i < std::min(n_devs, llama_max_devices()); ++i) {
+            if (params.tensor_split[i] != 0.0f) {
+                return; // the user set a split
+            }
+        }
+    }
+    std::vector<size_t> free_mem(n_devs, 0);
+    for (size_t i = 0; i < n_devs; ++i) {
+        size_t total = 0;
+        ggml_backend_dev_memory(devs[i], &free_mem[i], &total);
+    }
+    const size_t free_min = *std::min_element(free_mem.begin(), free_mem.end());
+    const size_t free_max = *std::max_element(free_mem.begin(), free_mem.end());
+    if (free_min == 0 || free_min >= 0.9 * free_max) {
+        return; // not reported, or close enough to even
+    }
+    constexpr double GiB = 1024.0*1024.0*1024.0;
+    std::string have;
+    std::string split;
+    for (size_t i = 0; i < n_devs; ++i) {
+        have  += format("%s%s %.1f GiB", i ? ", " : "", ggml_backend_dev_name(devs[i]), free_mem[i]/GiB);
+        split += format("%s%.0f", i ? "," : "", std::max(1.0, std::round(free_mem[i]/GiB)));
+    }
+    std::string split_bench = split;
+    std::replace(split_bench.begin(), split_bench.end(), ',', '/');
+    LLAMA_LOG_WARN("%s: -sm tensor gives every device an equal share of each layer unless --tensor-split is set, "
+        "but free memory differs (%s); if a device runs out of memory, split by memory: "
+        "--tensor-split %s (llama-bench: -ts %s)\n", __func__, have.c_str(), split.c_str(), split_bench.c_str());
+}
+
 // returns true on success
 static bool llama_prepare_model_devices(const llama_model_params & params, llama_model * model) {
     // create list of devices to use with this model
@@ -171,6 +209,7 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
             for (size_t i = 0; i < n_devs; ++i) {
                 LLAMA_LOG_INFO("%s: - device %zu: %s\n", __func__, i, ggml_backend_dev_name(params.devices[i]));
             }
+            llama_warn_even_tensor_split(params, params.devices, n_devs);
             model->get_split_state_ud.n_devices = n_devs;
             model->get_split_state_ud.model = model;
             model->devices.push_back({
@@ -210,6 +249,7 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
             for (size_t i = 0; i < devs.size(); ++i) {
                 LLAMA_LOG_INFO("%s: - device %zu: %s (%s)\n", __func__, i, ggml_backend_dev_name(devs[i]), ggml_backend_dev_description(devs[i]));
             }
+            llama_warn_even_tensor_split(params, devs.data(), devs.size());
 
             GGML_ASSERT(!devs.empty());
             model->get_split_state_ud.n_devices = devs.size();

@@ -1868,6 +1868,12 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer_n(ggml_b
                 t->buffer = meta_buf_ctx->bufs[i].get();
             }
         }
+        if (!meta_buf_ctx->bufs[i]) {
+            // logged as an error so that tools which show only errors (llama-bench without -v) print it before the abort;
+            // the usual cause is the even default split on devices with different amounts of free memory
+            GGML_LOG_ERROR("%s: failed to allocate the share of %s for tensor parallelism; on devices with different "
+                "amounts of memory, split by memory with --tensor-split (-ts)\n", __func__, ggml_backend_buft_name(simple_buft));
+        }
         GGML_ASSERT(meta_buf_ctx->bufs[i]);
         meta_buf->size = std::max(meta_buf->size, ggml_backend_buffer_get_size(meta_buf_ctx->bufs[i].get()));
     }
